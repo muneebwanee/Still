@@ -1,0 +1,1 @@
+{"name":"still-screen-relay","version":"1.2.0","private":true,"type":"module","engines":{"node":">=22"},"scripts":{"start":"node server.mjs","test":"node --test test/*.test.mjs"},"dependencies":{"ws":"8.22.2"},"devDependencies":{"playwright":"1.65.0"}}

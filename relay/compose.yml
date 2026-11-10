@@ -1,0 +1,23 @@
+services:
+  relay:
+    build: .
+    restart: unless-stopped
+    env_file: config.local.env
+    expose: ["8080"]
+    read_only: true
+    cap_drop: [ALL]
+    security_opt: [no-new-privileges:true]
+    mem_limit: 256m
+  caddy:
+    image: caddy:2-alpine
+    restart: unless-stopped
+    environment:
+      SHARING_DOMAIN: ${SHARING_DOMAIN:?Set SHARING_DOMAIN in your shell}
+    ports: ["80:80", "443:443", "443:443/udp"]
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy_data:/data
+      - caddy_config:/config
+volumes:
+  caddy_data:
+  caddy_config:
