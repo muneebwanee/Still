@@ -1,0 +1,85 @@
+name: Still
+options:
+  bundleIdPrefix: com.muneebwanee
+  deploymentTarget:
+    iOS: '17.0'
+  xcodeVersion: '16.2'
+  createIntermediateGroups: true
+packages:
+  ReceiverCore:
+    path: Packages/ReceiverCore
+  WebRTC:
+    url: https://github.com/stasel/WebRTC.git
+    exactVersion: 157.0.0
+settings:
+  base:
+    SWIFT_VERSION: '5.0'
+    SWIFT_STRICT_CONCURRENCY: targeted
+    IPHONEOS_DEPLOYMENT_TARGET: '17.0'
+    MARKETING_VERSION: '1.2.0'
+    CURRENT_PROJECT_VERSION: '3'
+    DEVELOPMENT_TEAM: ''
+    CODE_SIGN_STYLE: Automatic
+    ENABLE_USER_SCRIPT_SANDBOXING: YES
+    CLANG_ENABLE_MODULES: YES
+    SWIFT_EMIT_LOC_STRINGS: YES
+targets:
+  Still:
+    type: application
+    platform: iOS
+    sources:
+      - path: Still
+        excludes:
+          - Resources
+      - path: Still/Resources
+        buildPhase: resources
+        excludes:
+          - Info.plist
+    dependencies:
+      - package: ReceiverCore
+      - package: WebRTC
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: com.muneebwanee.still
+        INFOPLIST_FILE: Still/Resources/Info.plist
+        ASSETCATALOG_COMPILER_APPICON_NAME: AppIcon
+        ASSETCATALOG_COMPILER_GLOBAL_ACCENT_COLOR_NAME: AccentColor
+        TARGETED_DEVICE_FAMILY: '1,2'
+        SUPPORTS_MACCATALYST: NO
+        SUPPORTS_XR_DESIGNED_FOR_IPHONE_IPAD: NO
+        GENERATE_INFOPLIST_FILE: NO
+  StillTests:
+    type: bundle.unit-test
+    platform: iOS
+    sources: [StillTests]
+    dependencies:
+      - target: Still
+      - package: WebRTC
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: com.muneebwanee.still.tests
+        GENERATE_INFOPLIST_FILE: YES
+  StillUITests:
+    type: bundle.ui-testing
+    platform: iOS
+    sources: [StillUITests]
+    dependencies:
+      - target: Still
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: com.muneebwanee.still.uitests
+        GENERATE_INFOPLIST_FILE: YES
+schemes:
+  Still:
+    build:
+      targets:
+        Still: all
+    run:
+      config: Debug
+    test:
+      config: Debug
+      targets:
+        - StillTests
+        - StillUITests
+    archive:
+      config: Release
