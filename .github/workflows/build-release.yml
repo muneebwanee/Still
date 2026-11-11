@@ -1,0 +1,391 @@
+name: Build ZIP and release
+
+on:
+  push:
+    branches: [main, master]
+    paths:
+      - Still-source.zip
+      - .github/workflows/build-release.yml
+  workflow_dispatch:
+    inputs:
+      sign_ios:
+        description: Sign the IPA using Apple credentials in repository Secrets
+        type: boolean
+        default: false
+      export_method:
+        description: Signed IPA distribution method (must match the profile)
+        type: choice
+        options: [release-testing, app-store-connect]
+        default: release-testing
+      build_android:
+        description: Also build the Android screen sender test APK
+        type: boolean
+        default: true
+
+permissions:
+  contents: read
+concurrency:
+  group: still-zip-release-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  ARCHIVE_PATH: Still-source.zip
+
+jobs:
+  prepare:
+    name: Unpack ZIP and validate
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    outputs:
+      app_version: ${{ steps.unpack.outputs.app_version }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+      - name: Validate and unpack uploaded ZIP
+        id: unpack
+        shell: bash
+        run: |
+          test -f "$ARCHIVE_PATH" || { echo 'Upload Still-source.zip to the repository root first.'; exit 1; }
+          python3 - "$ARCHIVE_PATH" project <<'PY'
+          #!/usr/bin/env python3
+          """Validate and unpack a single Still source ZIP without executing archive code."""
+          from pathlib import Path, PurePosixPath
+          import os
+          import re
+          import stat
+          import sys
+          import zipfile
+
+          MAX_FILES = 4000
+          MAX_UNCOMPRESSED = 256 * 1024 * 1024
+          REQUIRED = ('project.yml', 'scripts/build-ipa.sh', 'Packages/ReceiverCore/Package.swift', 'Still/Resources/documents.json', 'android-sender/settings.gradle', 'relay/package-lock.json')
+
+          def unpack(archive, destination):
+              destination = Path(destination)
+              if destination.is_symlink() or (destination.exists() and not destination.is_dir()):
+                  raise ValueError("Extraction directory must be a real directory.")
+              if destination.exists() and any(destination.iterdir()):
+                  raise ValueError('Extraction directory must be empty.')
+              with zipfile.ZipFile(archive) as source:
+                  entries = source.infolist()
+                  if not entries or len(entries) > MAX_FILES or sum(e.file_size for e in entries) > MAX_UNCOMPRESSED:
+                      raise ValueError('Archive is empty or exceeds the build limits.')
+                  paths = []
+                  for entry in entries:
+                      name = entry.filename
+                      parts = PurePosixPath(name).parts
+                      mode = entry.external_attr >> 16
+                      if not parts or name.startswith('/') or '\\' in name or any(p in ('.', '..') or ':' in p for p in parts):
+                          raise ValueError('Archive contains an unsafe path.')
+                      if stat.S_ISLNK(mode) or (stat.S_IFMT(mode) not in (0, stat.S_IFREG, stat.S_IFDIR)) or entry.flag_bits & 1:
+                          raise ValueError('Links, special files and encrypted entries are not supported.')
+                      paths.append((entry, parts))
+                  names = {entry.filename.rstrip('/') for entry in entries}
+                  if 'project.yml' in names:
+                      prefix = ()
+                  else:
+                      roots = {parts[0] for _, parts in paths}
+                      if len(roots) != 1:
+                          raise ValueError('ZIP must contain one Still project folder.')
+                      prefix = (next(iter(roots)),)
+                  planned = []
+                  seen = set()
+                  for entry, parts in paths:
+                      relative = parts[len(prefix):]
+                      if not relative:
+                          continue
+                      canonical = '/'.join(relative)
+                      if canonical.casefold() in seen:
+                          raise ValueError('Archive contains duplicate or case-colliding paths.')
+                      seen.add(canonical.casefold())
+                      planned.append((entry, relative))
+                  files = {'/'.join(relative) for entry, relative in planned if not entry.is_dir()}
+                  if not all(required in files for required in REQUIRED):
+                      raise ValueError('ZIP is missing required Still source files. Upload the supplied Still-source.zip.')
+                  destination.mkdir(parents=True, exist_ok=True)
+                  for entry, relative in planned:
+                      target = destination.joinpath(*relative)
+                      if entry.is_dir():
+                          target.mkdir(parents=True, exist_ok=True)
+                      else:
+                          target.parent.mkdir(parents=True, exist_ok=True)
+                          with source.open(entry) as stream, target.open('xb') as output:
+                              import shutil
+                              shutil.copyfileobj(stream, output)
+                          target.chmod(0o755 if relative[0] == 'scripts' and target.suffix == '.sh' else 0o644)
+              match = re.search(r'''(?m)^\s*MARKETING_VERSION:\s*['"]?([0-9]+\.[0-9]+\.[0-9]+)['"]?\s*$''', (destination / 'project.yml').read_text())
+              if not match:
+                  raise ValueError('project.yml must contain a numeric MARKETING_VERSION.')
+              return match.group(1)
+
+          if __name__ == '__main__':
+              if len(sys.argv) != 3:
+                  raise SystemExit('Usage: unpack-release.py source.zip destination')
+              version = unpack(sys.argv[1], sys.argv[2])
+              if os.environ.get('GITHUB_OUTPUT'):
+                  with open(os.environ['GITHUB_OUTPUT'], 'a') as output:
+                      output.write('app_version=' + version + '\n')
+              print('Validated and extracted Still ' + version + '.')
+          PY
+      - name: Preserve extracted source for build jobs
+        run: tar -czf source-tree.tar.gz -C project .
+      - name: Check local remote and offline documents
+        working-directory: project
+        run: |
+          node tests/remote.test.mjs
+          node tests/documents.test.mjs
+          bash -n scripts/build-ipa.sh
+      - name: Check connection service
+        working-directory: project/relay
+        run: |
+          npm ci --omit=dev --ignore-scripts
+          npm test
+          npm audit --omit=dev
+      - uses: actions/upload-artifact@v4
+        with:
+          name: still-unpacked-source
+          path: source-tree.tar.gz
+          retention-days: 3
+          if-no-files-found: error
+
+  ios:
+    name: Test and build iOS IPA
+    needs: prepare
+    runs-on: macos-15
+    timeout-minutes: 50
+    env:
+      VERSION: ${{ needs.prepare.outputs.app_version }}
+      REQUEST_SIGNING: ${{ github.event_name == 'workflow_dispatch' && inputs.sign_ios || false }}
+      EXPORT_METHOD: ${{ inputs.export_method || 'release-testing' }}
+      APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+      BUNDLE_ID: ${{ vars.IOS_BUNDLE_ID || 'com.muneebwanee.still' }}
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: still-unpacked-source
+      - name: Restore source
+        run: |
+          mkdir project
+          tar -xzf source-tree.tar.gz -C project
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+      - name: Generate Xcode project and test core
+        working-directory: project
+        run: |
+          brew list --versions xcodegen >/dev/null || brew install xcodegen
+          xcodebuild -version
+          swift test --package-path Packages/ReceiverCore
+          xcodegen generate
+      - name: Select an available iPhone simulator
+        run: |
+          python3 - <<'PY'
+          import json, os, subprocess
+          devices = json.loads(subprocess.check_output(['xcrun','simctl','list','devices','available','--json']))['devices']
+          candidates = [d for runtime, group in devices.items() if 'iOS' in runtime for d in group if d.get('isAvailable') and d['name'].startswith('iPhone')]
+          if not candidates: raise SystemExit('No iPhone simulator is available on this runner.')
+          with open(os.environ['GITHUB_ENV'], 'a') as output:
+              output.write('SIMULATOR_ID=' + candidates[0]['udid'] + '\n')
+          PY
+      - name: Test recording, onboarding, settings and wipe
+        working-directory: project
+        run: |
+          xcodebuild -project Still.xcodeproj -scheme Still -configuration Debug -destination "platform=iOS Simulator,id=$SIMULATOR_ID" -resultBundlePath build/Tests.xcresult CODE_SIGNING_ALLOWED=NO test
+      - name: Import Apple signing credentials (optional)
+        if: env.REQUEST_SIGNING == 'true'
+        env:
+          CERTIFICATE: ${{ secrets.IOS_CERTIFICATE_BASE64 }}
+          CERTIFICATE_PASSWORD: ${{ secrets.IOS_CERTIFICATE_PASSWORD }}
+          PROFILE: ${{ secrets.IOS_PROFILE_BASE64 }}
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import base64, os, pathlib, re
+          if not re.fullmatch(r'[A-Z0-9]{10}', os.environ.get('APPLE_TEAM_ID','')):
+              raise SystemExit('Add a valid APPLE_TEAM_ID repository secret.')
+          if not re.fullmatch(r'[A-Za-z0-9-]+(?:\.[A-Za-z0-9-]+)+', os.environ['BUNDLE_ID']):
+              raise SystemExit('IOS_BUNDLE_ID must be a registered bundle identifier.')
+          if os.environ['EXPORT_METHOD'] not in ('release-testing','app-store-connect'):
+              raise SystemExit('Choose a supported signed distribution method.')
+          root = pathlib.Path(os.environ['RUNNER_TEMP'])
+          for variable, filename in [('CERTIFICATE','still-certificate.p12'),('PROFILE','still-profile.mobileprovision')]:
+              value = os.environ.get(variable,'')
+              if not value: raise SystemExit('Missing signing secret: '+variable)
+              (root/filename).write_bytes(base64.b64decode(value, validate=True))
+          PY
+          KEYCHAIN_PASSWORD=$(openssl rand -hex 24)
+          echo "::add-mask::$KEYCHAIN_PASSWORD"
+          security create-keychain -p "$KEYCHAIN_PASSWORD" "$RUNNER_TEMP/still.keychain-db"
+          security set-keychain-settings -lut 21600 "$RUNNER_TEMP/still.keychain-db"
+          security unlock-keychain -p "$KEYCHAIN_PASSWORD" "$RUNNER_TEMP/still.keychain-db"
+          security import "$RUNNER_TEMP/still-certificate.p12" -P "$CERTIFICATE_PASSWORD" -A -t cert -f pkcs12 -k "$RUNNER_TEMP/still.keychain-db"
+          security set-key-partition-list -S apple-tool:,apple:,codesign: -k "$KEYCHAIN_PASSWORD" "$RUNNER_TEMP/still.keychain-db"
+          security list-keychains -d user -s "$RUNNER_TEMP/still.keychain-db" login.keychain-db
+          security cms -D -i "$RUNNER_TEMP/still-profile.mobileprovision" > "$RUNNER_TEMP/still-profile.plist"
+          python3 - <<'PY'
+          import datetime, json, os, pathlib, plistlib, shutil, uuid
+          root = pathlib.Path(os.environ['RUNNER_TEMP'])
+          profile = plistlib.loads((root/'still-profile.plist').read_bytes())
+          expected = os.environ['APPLE_TEAM_ID']+'.'+os.environ['BUNDLE_ID']
+          if profile['Entitlements']['application-identifier'] != expected:
+              raise SystemExit('Your provisioning profile does not match APPLE_TEAM_ID and IOS_BUNDLE_ID.')
+          if profile['ExpirationDate'].replace(tzinfo=datetime.timezone.utc) <= datetime.datetime.now(datetime.timezone.utc):
+              raise SystemExit('Your provisioning profile has expired.')
+          identifier = str(uuid.UUID(profile['UUID'])).upper()
+          folder = pathlib.Path.home()/'Library/MobileDevice/Provisioning Profiles'
+          folder.mkdir(parents=True, exist_ok=True)
+          shutil.copy(root/'still-profile.mobileprovision', folder/(identifier+'.mobileprovision'))
+          with open(os.environ['GITHUB_ENV'],'a') as output: output.write('PROFILE_UUID='+identifier+'\n')
+          settings = {'PRODUCT_BUNDLE_IDENTIFIER':os.environ['BUNDLE_ID'], 'DEVELOPMENT_TEAM':os.environ['APPLE_TEAM_ID'], 'CODE_SIGN_STYLE':'Manual', 'CODE_SIGN_IDENTITY':'Apple Distribution', 'PROVISIONING_PROFILE_SPECIFIER':identifier}
+          spec = 'include:\n  - project.yml\ntargets:\n  Still:\n    settings:\n      base:\n'
+          spec += ''.join('        '+key+': '+json.dumps(value)+'\n' for key,value in settings.items())
+          pathlib.Path('project/project.signed.yml').write_text(spec)
+          options = {'method':os.environ['EXPORT_METHOD'],'teamID':os.environ['APPLE_TEAM_ID'],'signingStyle':'manual','signingCertificate':'Apple Distribution','provisioningProfiles':{os.environ['BUNDLE_ID']:identifier}}
+          (root/'Still-ExportOptions.plist').write_bytes(plistlib.dumps(options))
+          PY
+      - name: Build unsigned IPA (default)
+        if: env.REQUEST_SIGNING != 'true'
+        working-directory: project
+        run: |
+          ./scripts/build-ipa.sh
+          mkdir -p ../release
+          cp build/Still-unsigned.ipa "../release/Still-$VERSION-unsigned.ipa"
+      - name: Build signed IPA (optional)
+        if: env.REQUEST_SIGNING == 'true'
+        working-directory: project
+        run: |
+          set -euo pipefail
+          xcodegen generate --spec project.signed.yml
+          xcodebuild -project Still.xcodeproj -scheme Still -configuration Release -destination 'generic/platform=iOS' -archivePath build/Still.xcarchive archive
+          xcodebuild -exportArchive -archivePath build/Still.xcarchive -exportPath build/signed -exportOptionsPlist "$RUNNER_TEMP/Still-ExportOptions.plist"
+          mkdir -p ../release
+          cp build/signed/Still.ipa "../release/Still-$VERSION-$EXPORT_METHOD.ipa"
+      - name: Upload IPA
+        uses: actions/upload-artifact@v4
+        with:
+          name: still-ios-release
+          path: release/*.ipa
+          if-no-files-found: error
+          retention-days: 14
+      - name: Upload simulator results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: still-ios-test-results
+          path: project/build/Tests.xcresult
+          if-no-files-found: ignore
+          retention-days: 7
+      - name: Remove signing material
+        if: always() && env.REQUEST_SIGNING == 'true'
+        run: |
+          security delete-keychain "$RUNNER_TEMP/still.keychain-db" || true
+          rm -f "$RUNNER_TEMP/still-certificate.p12" "$RUNNER_TEMP/still-profile.mobileprovision" "$RUNNER_TEMP/still-profile.plist" "$RUNNER_TEMP/Still-ExportOptions.plist"
+          if [ -n "${PROFILE_UUID:-}" ]; then rm -f "$HOME/Library/MobileDevice/Provisioning Profiles/$PROFILE_UUID.mobileprovision"; fi
+
+  android:
+    name: Build Android sender (optional)
+    needs: prepare
+    if: github.event_name != 'workflow_dispatch' || inputs.build_android
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    env:
+      VERSION: ${{ needs.prepare.outputs.app_version }}
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: still-unpacked-source
+      - name: Restore source
+        run: |
+          mkdir project
+          tar -xzf source-tree.tar.gz -C project
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+      - uses: android-actions/setup-android@v3
+        with:
+          packages: 'platform-tools platforms;android-36 build-tools;36.0.0'
+      - uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: '8.13'
+      - name: Build and lint sender test APK
+        working-directory: project/android-sender
+        run: gradle --no-daemon assembleDebug lintDebug
+      - name: Collect sender APK
+        run: |
+          mkdir -p release
+          cp project/android-sender/app/build/outputs/apk/debug/app-debug.apk "release/Still-Sender-$VERSION-debug.apk"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: still-android-release
+          path: release/*.apk
+          if-no-files-found: error
+          retention-days: 14
+
+  release:
+    name: Publish GitHub prerelease
+    needs: [prepare, ios, android]
+    if: >-
+      always() && !cancelled() &&
+      needs.prepare.result == 'success' &&
+      needs.ios.result == 'success' &&
+      (needs.android.result == 'success' || needs.android.result == 'skipped')
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: write
+    env:
+      GH_TOKEN: ${{ github.token }}
+      GH_REPO: ${{ github.repository }}
+      VERSION: ${{ needs.prepare.outputs.app_version }}
+      REQUEST_SIGNING: ${{ github.event_name == 'workflow_dispatch' && inputs.sign_ios || false }}
+      EXPORT_METHOD: ${{ inputs.export_method || 'release-testing' }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/download-artifact@v4
+        with:
+          name: still-ios-release
+          path: release
+      - uses: actions/download-artifact@v4
+        if: needs.android.result == 'success'
+        with:
+          name: still-android-release
+          path: release
+      - name: Prepare release notes and checksums
+        shell: bash
+        run: |
+          set -euo pipefail
+          cp "$ARCHIVE_PATH" release/Still-source.zip
+          python3 - <<'PY'
+          import hashlib, os, pathlib
+          root = pathlib.Path('release')
+          lines = [hashlib.sha256(path.read_bytes()).hexdigest()+'  '+path.name for path in sorted(root.iterdir()) if path.is_file()]
+          (root/'SHA256SUMS.txt').write_text('\n'.join(lines)+'\n')
+          signed = os.environ['REQUEST_SIGNING']=='true'
+          mode = os.environ['EXPORT_METHOD']
+          installation = ('Signed IPA: '+('for registered ad hoc devices only.' if mode=='release-testing' else 'for TestFlight/App Store Connect upload, not direct installation.')) if signed else 'Unsigned IPA: must be signed before installing on an iPhone/iPad. It is not directly installable.'
+          notes = '# Still '+os.environ['VERSION']+'\n\n'+installation+'\n\n'
+          notes += 'If included, the Android sender APK is a debug test build, not a Play Store release.\n\n'
+          notes += 'The source ZIP, IPA and optional sender APK are attached below with SHA-256 checksums. This workflow tests core logic and the iOS simulator before publishing; physical-device validation and store review are separate.\n\n'
+          notes += 'Whole-screen receiving requires the iOS app to stay in the foreground. Internet screen sharing needs a separately deployed HTTPS/TURN service; this workflow does not deploy it. iPhone/iPad whole-screen sending and screen audio are not included.\n'
+          pathlib.Path('release-notes.md').write_text(notes)
+          PY
+      - name: Create or update build prerelease
+        shell: bash
+        run: |
+          set -euo pipefail
+          TAG="still-build-$GITHUB_RUN_NUMBER-${GITHUB_SHA:0:7}"
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            gh release edit "$TAG" --title "Still $VERSION · build $GITHUB_RUN_NUMBER" --notes-file release-notes.md --prerelease
+            gh release upload "$TAG" release/* --clobber
+          else
+            gh release create "$TAG" release/* --target "$GITHUB_SHA" --title "Still $VERSION · build $GITHUB_RUN_NUMBER" --notes-file release-notes.md --prerelease
+          fi
+          URL=$(gh release view "$TAG" --json url --jq .url)
+          printf '### Still build ready\n\n[Open the GitHub release](%s)\n' "$URL" >> "$GITHUB_STEP_SUMMARY"
